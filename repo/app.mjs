@@ -11,6 +11,11 @@ app.use(express.json());
 // Read by GET /api/config/export.
 let configStore = [];
 
+// Root health check — some test suites probe GET / for liveness
+app.get('/', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -119,6 +124,13 @@ app.get('/api/config/export', (req, res) => {
 
   res.set('Content-Type', 'application/xml');
   return res.status(200).send(xml);
+});
+
+// Global error handler — catches any unhandled errors and returns JSON
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ error: err.message || 'Internal server error' });
 });
 
 // ---------------------------------------------------------------------------
