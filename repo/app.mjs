@@ -1,45 +1,42 @@
 import express from 'express';
-import { createServer } from 'node:http';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
+app.use(express.json());
 
-// ── Config store ────────────────────────────────────────────────────────────
-// Seeded so GET /api/config/export always has at least one <provider> element.
+// In-memory config store — seeded so export always has at least one <provider>
 let configStore = [
   { name: 'github', clientId: 'placeholder-id', clientSecret: 'placeholder-secret', callbackUrl: 'http://localhost:9090/auth/callback' }
 ];
 
-// ── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ status: 'ok' }));
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// ── /vuln ────────────────────────────────────────────────────────────────────
-app.post('/vuln', express.json(), (req, res) => {
-  const input         = req.body?.input         ?? '';
-  const expectedState = req.body?.expectedState  ?? 'legitimate-state-value';
-  res.json({ result: parseOAuthCallbackInput(input, expectedState) });
-});
-app.get('/vuln', (req, res) => {
-  const input         = req.query?.input         ?? '';
-  const expectedState = req.query?.expectedState  ?? 'legitimate-state-value';
-  res.json({ result: parseOAuthCallbackInput(input, expectedState) });
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
 });
 
-// ── POST /api/config/import ──────────────────────────────────────────────────
+// /vuln endpoint — demonstrates GHSA-7rcp-mxpq-72pj
+app.all('/vuln', (req, res) => {
+  const input         = req.body?.input         ?? req.query?.input         ?? '';
+  const expectedState = req.body?.expectedState  ?? req.query?.expectedState  ?? 'legitimate-state-value';
+  const result = parseOAuthCallbackInput(input, expectedState);
+  res.json({ result });
+});
+
+// POST /api/config/import
+// Accepts Content-Type: application/xml or text/xml with XML in the request body.
+// ?dry_run=true returns { changes: [...] } without persisting.
 app.post('/api/config/import', (req, res) => {
   const ct = req.headers['content-type'] || '';
   if (!ct.includes('application/xml') && !ct.includes('text/xml')) {
     return res.status(400).json({ error: 'Content-Type must be application/xml or text/xml' });
   }
 
-  // Collect body chunks manually — no body-parser dependency
   const chunks = [];
-  req.on('data', (c) => chunks.push(c));
+  req.on('data', (chunk) => chunks.push(chunk));
   req.on('error', (err) => res.status(500).json({ error: err.message }));
   req.on('end', () => {
     const xml = Buffer.concat(chunks).toString('utf-8').trim();
-
     if (!xml) {
       return res.status(400).json({ error: 'Request body is empty.' });
     }
@@ -51,8 +48,7 @@ app.post('/api/config/import', (req, res) => {
       return res.status(400).json({ error: e.message });
     }
 
-    const isDryRun = req.query.dry_run === 'true';
-    if (isDryRun) {
+    if (req.query.dry_run === 'true') {
       return res.status(200).json({ changes: providers.map((p) => ({ action: 'add', provider: p })) });
     }
 
@@ -61,7 +57,7 @@ app.post('/api/config/import', (req, res) => {
   });
 });
 
-// ── GET /api/config/export ───────────────────────────────────────────────────
+// GET /api/config/export
 app.get('/api/config/export', (_req, res) => {
   const inner = configStore.map(({ name, ...fields }) => {
     const kids = Object.entries(fields)
@@ -69,19 +65,16 @@ app.get('/api/config/export', (_req, res) => {
       .join('\n');
     return `  <provider name="${esc(String(name))}">\n${kids}\n  </provider>`;
   }).join('\n');
-
   res.set('Content-Type', 'application/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>\n<config>\n${inner}\n</config>`);
 });
 
-// ── XML helpers ──────────────────────────────────────────────────────────────
 function parseOAuthXml(xml) {
   if (!xml.includes('<config') || !xml.includes('</config>')) {
     throw new Error('Invalid XML: missing <config> root element');
   }
   const m = xml.match(/<config[^>]*>([\s\S]*?)<\/config>/);
   if (!m) throw new Error('Invalid XML: malformed <config>');
-
   const providers = [];
   const pRe = /<provider([^>]*)>([\s\S]*?)<\/provider>/g;
   let pm;
@@ -101,7 +94,6 @@ function esc(s) {
           .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-// ── Start ────────────────────────────────────────────────────────────────────
-createServer(app).listen(9090, '0.0.0.0', () => {
+app.listen(9090, '0.0.0.0', () => {
   console.log('Carrier app listening on http://0.0.0.0:9090');
 });
