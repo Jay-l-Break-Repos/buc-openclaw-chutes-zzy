@@ -1,13 +1,28 @@
 import express from 'express';
-import multer from 'multer';
 import { XMLParser } from 'fast-xml-parser';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
 app.use(express.json());
 
-// Configure multer to store uploaded files in memory
-const upload = multer({ storage: multer.memoryStorage() });
+// Parse raw XML bodies for application/xml and text/xml content types
+app.use((req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('application/xml') || contentType.includes('text/xml')) {
+    let data = '';
+    req.setEncoding('utf-8');
+    req.on('data', (chunk) => { data += chunk; });
+    req.on('end', () => {
+      req.rawXml = data;
+      next();
+    });
+    req.on('error', (err) => {
+      next(err);
+    });
+  } else {
+    next();
+  }
+});
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -33,59 +48,73 @@ app.all('/vuln', (req, res) => {
 });
 
 // POST /api/config/import
-// Accepts a multipart/form-data file upload containing an XML configuration file.
-// Parses the XML and returns the parsed data in the response.
-// Future steps will add schema validation and persistence to the config store.
-app.post('/api/config/import', upload.single('file'), (req, res) => {
-  // Ensure a file was uploaded
-  if (!req.file) {
+// Accepts an XML body (Content-Type: application/xml or text/xml) containing
+// OAuth provider configuration. Parses the XML and returns the providers array.
+//
+// Expected XML structure:
+//   <config>
+//     <provider name="github">
+//       <clientId>abc123</clientId>
+//       <clientSecret>secret456</clientSecret>
+//       <callbackUrl>http://localhost:9090/auth/callback</callbackUrl>
+//     </provider>
+//   </config>
+//
+// Response: { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
+app.post('/api/config/import', (req, res) => {
+  // Validate Content-Type
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
     return res.status(400).json({
-      success: false,
-      error: 'No file uploaded. Please provide an XML file in the "file" field.'
+      error: 'Content-Type must be application/xml or text/xml'
     });
   }
 
-  // Ensure the uploaded file is XML (by MIME type or extension)
-  const mimeType = req.file.mimetype || '';
-  const originalName = req.file.originalname || '';
-  const isXmlMime = mimeType === 'application/xml' || mimeType === 'text/xml';
-  const isXmlExt = originalName.toLowerCase().endsWith('.xml');
-
-  if (!isXmlMime && !isXmlExt) {
+  // Ensure we received a body
+  const xmlContent = req.rawXml;
+  if (!xmlContent || xmlContent.trim() === '') {
     return res.status(400).json({
-      success: false,
-      error: 'Uploaded file does not appear to be XML. Please upload a valid XML configuration file.'
+      error: 'Request body is empty. Please provide an XML configuration.'
     });
   }
 
-  // Parse the XML content
-  const xmlContent = req.file.buffer.toString('utf-8');
-
-  let parsedData;
+  // Parse the XML
+  let parsed;
   try {
     const parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
       parseAttributeValue: true,
       parseTagValue: true,
-      trimValues: true
+      trimValues: true,
+      isArray: (tagName) => tagName === 'provider'  // always treat <provider> as array
     });
-    parsedData = parser.parse(xmlContent);
+    parsed = parser.parse(xmlContent);
   } catch (parseError) {
     return res.status(422).json({
-      success: false,
       error: `Failed to parse XML: ${parseError.message}`
     });
   }
 
-  // Return success with the parsed data
-  return res.status(200).json({
-    success: true,
-    message: 'XML configuration file parsed successfully.',
-    filename: req.file.originalname,
-    size: req.file.size,
-    data: parsedData
+  // Validate root element
+  if (!parsed || !parsed.config) {
+    return res.status(422).json({
+      error: 'Invalid XML structure: missing <config> root element'
+    });
+  }
+
+  // Extract providers — fast-xml-parser returns an array (forced by isArray above)
+  // or undefined if no <provider> elements exist
+  const rawProviders = parsed.config.provider;
+  const providerList = Array.isArray(rawProviders) ? rawProviders : [];
+
+  // Map each provider to a clean object: lift the name attribute and keep child elements
+  const providers = providerList.map((p) => {
+    const { '@_name': name, ...rest } = p;
+    return { name, ...rest };
   });
+
+  return res.status(200).json({ providers });
 });
 
 app.listen(9090, '0.0.0.0', () => {
