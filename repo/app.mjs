@@ -7,10 +7,6 @@ const app = express();
 // Parse JSON bodies (for /vuln and other JSON endpoints)
 app.use(express.json());
 
-// Parse XML bodies as plain text — populates req.body with the raw XML string
-// for requests with Content-Type: application/xml or text/xml
-app.use(express.text({ type: ['application/xml', 'text/xml'] }));
-
 // In-memory config store — holds the last successfully imported providers.
 // Populated by POST /api/config/import (when not dry_run).
 // Read by GET /api/config/export.
@@ -43,6 +39,9 @@ app.all('/vuln', (req, res) => {
 // Accepts an XML body (Content-Type: application/xml or text/xml) containing
 // OAuth provider configuration. Parses the XML and returns the providers array.
 //
+// Uses express.text({ type: '*/*' }) as route-level middleware so it only
+// applies here and cannot interfere with JSON parsing on other routes.
+//
 // Query params:
 //   dry_run=true  — parse and validate without persisting; returns { changes: [...] }
 //
@@ -57,71 +56,78 @@ app.all('/vuln', (req, res) => {
 //
 // Normal response:  { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
 // Dry-run response: { changes: [{ action: 'add', provider: { name, ... } }, ...] }
-app.post('/api/config/import', (req, res) => {
-  // Validate Content-Type
-  const contentType = req.headers['content-type'] || '';
-  if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
-    return res.status(400).json({
-      error: 'Content-Type must be application/xml or text/xml'
+app.post(
+  '/api/config/import',
+  // Route-level text body parser: captures the raw body as a string for any
+  // Content-Type, so the handler always has access to req.body regardless of
+  // whether the client sends a Content-Length or Transfer-Encoding header.
+  express.text({ type: '*/*' }),
+  (req, res) => {
+    // Validate Content-Type
+    const contentType = req.headers['content-type'] || '';
+    if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
+      return res.status(400).json({
+        error: 'Content-Type must be application/xml or text/xml'
+      });
+    }
+
+    // express.text() populates req.body with the raw string.
+    // Fall back to empty string if body was not captured.
+    const xmlContent = typeof req.body === 'string' ? req.body : '';
+    if (!xmlContent || xmlContent.trim() === '') {
+      return res.status(400).json({
+        error: 'Request body is empty. Please provide an XML configuration.'
+      });
+    }
+
+    // Parse the XML
+    let parsed;
+    try {
+      const parser = new XMLParser({
+        ignoreAttributes: false,
+        attributeNamePrefix: '@_',
+        parseAttributeValue: true,
+        parseTagValue: true,
+        trimValues: true,
+        isArray: (tagName) => tagName === 'provider'  // always treat <provider> as array
+      });
+      parsed = parser.parse(xmlContent);
+    } catch (parseError) {
+      return res.status(400).json({
+        error: `Failed to parse XML: ${parseError.message}`
+      });
+    }
+
+    // Validate root element
+    if (!parsed || !parsed.config) {
+      return res.status(400).json({
+        error: 'Invalid XML structure: missing <config> root element'
+      });
+    }
+
+    // Extract providers — fast-xml-parser returns an array (forced by isArray above)
+    // or undefined if no <provider> elements exist
+    const rawProviders = parsed.config.provider;
+    const providerList = Array.isArray(rawProviders) ? rawProviders : [];
+
+    // Map each provider to a clean object: lift the name attribute and keep child elements
+    const providers = providerList.map((p) => {
+      const { '@_name': name, ...rest } = p;
+      return { name, ...rest };
     });
+
+    // Dry-run mode: return what would change without persisting
+    const isDryRun = req.query.dry_run === 'true';
+    if (isDryRun) {
+      const changes = providers.map((provider) => ({ action: 'add', provider }));
+      return res.status(200).json({ changes });
+    }
+
+    // Persist to in-memory config store and return the providers
+    configStore = providers;
+    return res.status(200).json({ providers });
   }
-
-  // express.text() populates req.body with the raw string for XML content types.
-  // If the body is missing or empty, req.body will be undefined or an empty string.
-  const xmlContent = typeof req.body === 'string' ? req.body : '';
-  if (!xmlContent || xmlContent.trim() === '') {
-    return res.status(400).json({
-      error: 'Request body is empty. Please provide an XML configuration.'
-    });
-  }
-
-  // Parse the XML
-  let parsed;
-  try {
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: '@_',
-      parseAttributeValue: true,
-      parseTagValue: true,
-      trimValues: true,
-      isArray: (tagName) => tagName === 'provider'  // always treat <provider> as array
-    });
-    parsed = parser.parse(xmlContent);
-  } catch (parseError) {
-    return res.status(400).json({
-      error: `Failed to parse XML: ${parseError.message}`
-    });
-  }
-
-  // Validate root element
-  if (!parsed || !parsed.config) {
-    return res.status(400).json({
-      error: 'Invalid XML structure: missing <config> root element'
-    });
-  }
-
-  // Extract providers — fast-xml-parser returns an array (forced by isArray above)
-  // or undefined if no <provider> elements exist
-  const rawProviders = parsed.config.provider;
-  const providerList = Array.isArray(rawProviders) ? rawProviders : [];
-
-  // Map each provider to a clean object: lift the name attribute and keep child elements
-  const providers = providerList.map((p) => {
-    const { '@_name': name, ...rest } = p;
-    return { name, ...rest };
-  });
-
-  // Dry-run mode: return what would change without persisting
-  const isDryRun = req.query.dry_run === 'true';
-  if (isDryRun) {
-    const changes = providers.map((provider) => ({ action: 'add', provider }));
-    return res.status(200).json({ changes });
-  }
-
-  // Persist to in-memory config store and return the providers
-  configStore = providers;
-  return res.status(200).json({ providers });
-});
+);
 
 // GET /api/config/export
 // Returns the current config store serialised as XML.
