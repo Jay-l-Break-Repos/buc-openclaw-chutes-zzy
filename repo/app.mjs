@@ -21,45 +21,17 @@ app.get('/health', (req, res) => {
 // Vulnerability: parseOAuthCallbackInput accepts a bare authorization code
 // (no URL, no state param) and returns { code, state } with the expectedState
 // injected — bypassing OAuth CSRF state validation entirely.
-//
-// Triggering example:
-//   POST /vuln  {"input": "bare_auth_code_no_url", "expectedState": "legitimate-state-value"}
-//   GET  /vuln?input=bare_auth_code_no_url&expectedState=legitimate-state-value
-//
-// The response will be {"result":{"code":"bare_auth_code_no_url","state":"legitimate-state-value"}}
-// proving the attacker-supplied code was accepted without state verification.
 app.all('/vuln', express.json(), (req, res) => {
   const input         = req.body?.input         ?? req.query?.input         ?? '';
   const expectedState = req.body?.expectedState  ?? req.query?.expectedState  ?? 'legitimate-state-value';
-
   const result = parseOAuthCallbackInput(input, expectedState);
   res.json({ result });
 });
 
 // POST /api/config/import
-// Accepts an XML body (Content-Type: application/xml or text/xml) containing
-// OAuth provider configuration. Parses the XML and returns the providers array.
-//
-// express.text({ type: '*/*' }) is used as route-level middleware to read the
-// raw body as a string. Using type:'*/*' ensures the body is always captured
-// regardless of Content-Length/Transfer-Encoding headers. Content-Type
-// validation is done inside the handler.
-//
-// Query params:
-//   dry_run=true  — parse and validate without persisting; returns { changes: [...] }
-//
-// Expected XML structure:
-//   <config>
-//     <provider name="github">
-//       <clientId>abc123</clientId>
-//       <clientSecret>secret456</clientSecret>
-//       <callbackUrl>http://localhost:9090/auth/callback</callbackUrl>
-//     </provider>
-//   </config>
-//
-// Normal response:  { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
-// Dry-run response: { changes: [{ action: 'add', provider: { name, ... } }, ...] }
-app.post('/api/config/import', express.text({ type: '*/*' }), (req, res) => {
+// Accepts an XML body (Content-Type: application/xml or text/xml).
+// Returns { providers: [...] } on success, or { changes: [...] } with ?dry_run=true.
+app.post('/api/config/import', readBody, (req, res) => {
   // Validate Content-Type
   const contentType = req.headers['content-type'] || '';
   if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
@@ -68,39 +40,33 @@ app.post('/api/config/import', express.text({ type: '*/*' }), (req, res) => {
     });
   }
 
-  // express.text() populates req.body with the raw string.
-  const xmlContent = typeof req.body === 'string' ? req.body : '';
-  if (!xmlContent || xmlContent.trim() === '') {
+  const xmlContent = req.rawBody || '';
+  if (!xmlContent.trim()) {
     return res.status(400).json({
       error: 'Request body is empty. Please provide an XML configuration.'
     });
   }
 
-  // Parse the XML
   let providers;
   try {
     providers = parseOAuthXml(xmlContent);
   } catch (parseError) {
-    return res.status(400).json({
-      error: parseError.message
+    return res.status(400).json({ error: parseError.message });
+  }
+
+  const isDryRun = req.query.dry_run === 'true';
+  if (isDryRun) {
+    return res.status(200).json({
+      changes: providers.map((provider) => ({ action: 'add', provider }))
     });
   }
 
-  // Dry-run mode: return what would change without persisting
-  const isDryRun = req.query.dry_run === 'true';
-  if (isDryRun) {
-    const changes = providers.map((provider) => ({ action: 'add', provider }));
-    return res.status(200).json({ changes });
-  }
-
-  // Persist to in-memory config store and return the providers
   configStore = providers;
   return res.status(200).json({ providers });
 });
 
 // GET /api/config/export
-// Returns the current config store serialised as XML.
-// Response: XML document with Content-Type: application/xml
+// Returns the current config store as XML.
 app.get('/api/config/export', (req, res) => {
   const providerXml = configStore.map((provider) => {
     const { name, ...fields } = provider;
@@ -111,7 +77,6 @@ app.get('/api/config/export', (req, res) => {
   }).join('\n');
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n${providerXml}\n</config>`;
-
   res.set('Content-Type', 'application/xml');
   return res.status(200).send(xml);
 });
@@ -122,6 +87,24 @@ app.use((err, req, res, next) => {
   const status = err.status || err.statusCode || 500;
   res.status(status).json({ error: err.message || 'Internal server error' });
 });
+
+// ---------------------------------------------------------------------------
+// readBody middleware — reads the entire request body into req.rawBody (string)
+// Uses Node's native stream events; no dependency on body-parser.
+// Always calls next() — errors are stored in req.rawBodyError.
+// ---------------------------------------------------------------------------
+function readBody(req, res, next) {
+  const chunks = [];
+  req.on('data', (chunk) => chunks.push(chunk));
+  req.on('end', () => {
+    req.rawBody = Buffer.concat(chunks).toString('utf-8');
+    next();
+  });
+  req.on('error', (err) => {
+    req.rawBodyError = err;
+    next();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Minimal XML parser for OAuth provider config
@@ -141,23 +124,18 @@ function parseOAuthXml(xml) {
   if (!configMatch) {
     throw new Error('Invalid XML structure: malformed <config> element');
   }
-  const configBody = configMatch[1];
 
   const providerRegex = /<provider([^>]*)>([\s\S]*?)<\/provider>/g;
   const providers = [];
   let match;
 
-  while ((match = providerRegex.exec(configBody)) !== null) {
-    const attrStr = match[1];
-    const body = match[2];
+  while ((match = providerRegex.exec(configMatch[1])) !== null) {
+    const nameMatch = match[1].match(/name\s*=\s*["']([^"']*)["']/);
+    const provider = { name: nameMatch ? nameMatch[1] : '' };
 
-    const nameMatch = attrStr.match(/name\s*=\s*["']([^"']*)["']/);
-    const name = nameMatch ? nameMatch[1] : '';
-
-    const provider = { name };
     const fieldRegex = /<([a-zA-Z][a-zA-Z0-9_-]*)>([^<]*)<\/\1>/g;
     let fieldMatch;
-    while ((fieldMatch = fieldRegex.exec(body)) !== null) {
+    while ((fieldMatch = fieldRegex.exec(match[2])) !== null) {
       provider[fieldMatch[1]] = fieldMatch[2].trim();
     }
 
