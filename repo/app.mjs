@@ -3,15 +3,12 @@ import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-
 
 const app = express();
 
-// Parse JSON bodies (for /vuln and other JSON endpoints)
-app.use(express.json());
-
 // In-memory config store — holds the last successfully imported providers.
 // Populated by POST /api/config/import (when not dry_run).
 // Read by GET /api/config/export.
 let configStore = [];
 
-// Root health check — some test suites probe GET / for liveness
+// Root health check — env.spec.ts probes GET / for liveness
 app.get('/', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -31,7 +28,7 @@ app.get('/health', (req, res) => {
 //
 // The response will be {"result":{"code":"bare_auth_code_no_url","state":"legitimate-state-value"}}
 // proving the attacker-supplied code was accepted without state verification.
-app.all('/vuln', (req, res) => {
+app.all('/vuln', express.json(), (req, res) => {
   const input         = req.body?.input         ?? req.query?.input         ?? '';
   const expectedState = req.body?.expectedState  ?? req.query?.expectedState  ?? 'legitimate-state-value';
 
@@ -43,8 +40,10 @@ app.all('/vuln', (req, res) => {
 // Accepts an XML body (Content-Type: application/xml or text/xml) containing
 // OAuth provider configuration. Parses the XML and returns the providers array.
 //
-// Uses express.text({ type: '*/*' }) as route-level middleware so it only
-// applies here and cannot interfere with JSON parsing on other routes.
+// express.text({ type: '*/*' }) is used as route-level middleware to read the
+// raw body as a string. Using type:'*/*' ensures the body is always captured
+// regardless of Content-Length/Transfer-Encoding headers. Content-Type
+// validation is done inside the handler.
 //
 // Query params:
 //   dry_run=true  — parse and validate without persisting; returns { changes: [...] }
@@ -60,58 +59,49 @@ app.all('/vuln', (req, res) => {
 //
 // Normal response:  { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
 // Dry-run response: { changes: [{ action: 'add', provider: { name, ... } }, ...] }
-app.post(
-  '/api/config/import',
-  // Route-level text body parser: captures the raw body as a string for any
-  // Content-Type, so the handler always has access to req.body regardless of
-  // whether the client sends a Content-Length or Transfer-Encoding header.
-  express.text({ type: '*/*' }),
-  (req, res) => {
-    // Validate Content-Type
-    const contentType = req.headers['content-type'] || '';
-    if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
-      return res.status(400).json({
-        error: 'Content-Type must be application/xml or text/xml'
-      });
-    }
-
-    // express.text() populates req.body with the raw string.
-    // Fall back to empty string if body was not captured.
-    const xmlContent = typeof req.body === 'string' ? req.body : '';
-    if (!xmlContent || xmlContent.trim() === '') {
-      return res.status(400).json({
-        error: 'Request body is empty. Please provide an XML configuration.'
-      });
-    }
-
-    // Parse the XML using the built-in parser
-    let providers;
-    try {
-      providers = parseOAuthXml(xmlContent);
-    } catch (parseError) {
-      return res.status(400).json({
-        error: parseError.message
-      });
-    }
-
-    // Dry-run mode: return what would change without persisting
-    const isDryRun = req.query.dry_run === 'true';
-    if (isDryRun) {
-      const changes = providers.map((provider) => ({ action: 'add', provider }));
-      return res.status(200).json({ changes });
-    }
-
-    // Persist to in-memory config store and return the providers
-    configStore = providers;
-    return res.status(200).json({ providers });
+app.post('/api/config/import', express.text({ type: '*/*' }), (req, res) => {
+  // Validate Content-Type
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('application/xml') && !contentType.includes('text/xml')) {
+    return res.status(400).json({
+      error: 'Content-Type must be application/xml or text/xml'
+    });
   }
-);
+
+  // express.text() populates req.body with the raw string.
+  const xmlContent = typeof req.body === 'string' ? req.body : '';
+  if (!xmlContent || xmlContent.trim() === '') {
+    return res.status(400).json({
+      error: 'Request body is empty. Please provide an XML configuration.'
+    });
+  }
+
+  // Parse the XML
+  let providers;
+  try {
+    providers = parseOAuthXml(xmlContent);
+  } catch (parseError) {
+    return res.status(400).json({
+      error: parseError.message
+    });
+  }
+
+  // Dry-run mode: return what would change without persisting
+  const isDryRun = req.query.dry_run === 'true';
+  if (isDryRun) {
+    const changes = providers.map((provider) => ({ action: 'add', provider }));
+    return res.status(200).json({ changes });
+  }
+
+  // Persist to in-memory config store and return the providers
+  configStore = providers;
+  return res.status(200).json({ providers });
+});
 
 // GET /api/config/export
 // Returns the current config store serialised as XML.
 // Response: XML document with Content-Type: application/xml
 app.get('/api/config/export', (req, res) => {
-  // Serialise each provider back to XML
   const providerXml = configStore.map((provider) => {
     const { name, ...fields } = provider;
     const fieldXml = Object.entries(fields)
@@ -126,7 +116,7 @@ app.get('/api/config/export', (req, res) => {
   return res.status(200).send(xml);
 });
 
-// Global error handler — catches any unhandled errors and returns JSON
+// Global error handler
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   const status = err.status || err.statusCode || 500;
@@ -135,37 +125,24 @@ app.use((err, req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // Minimal XML parser for OAuth provider config
-// Parses the specific structure:
-//   <config>
-//     <provider name="...">
-//       <field>value</field>
-//       ...
-//     </provider>
-//   </config>
-// Returns an array of provider objects: [{ name, field, ... }, ...]
-// Throws an Error with a descriptive message on any parse failure.
 // ---------------------------------------------------------------------------
 function parseOAuthXml(xml) {
   const str = xml.trim();
 
-  // Basic well-formedness: must start with < and end with >
   if (!str.startsWith('<') || !str.endsWith('>')) {
     throw new Error('Invalid XML: document must start with < and end with >');
   }
 
-  // Must contain a <config> root element
   if (!str.includes('<config') || !str.includes('</config>')) {
     throw new Error('Invalid XML structure: missing <config> root element');
   }
 
-  // Extract the content inside <config>...</config>
   const configMatch = str.match(/<config[^>]*>([\s\S]*?)<\/config>/);
   if (!configMatch) {
     throw new Error('Invalid XML structure: malformed <config> element');
   }
   const configBody = configMatch[1];
 
-  // Find all <provider ...>...</provider> blocks
   const providerRegex = /<provider([^>]*)>([\s\S]*?)<\/provider>/g;
   const providers = [];
   let match;
@@ -174,11 +151,9 @@ function parseOAuthXml(xml) {
     const attrStr = match[1];
     const body = match[2];
 
-    // Extract the name attribute
     const nameMatch = attrStr.match(/name\s*=\s*["']([^"']*)["']/);
     const name = nameMatch ? nameMatch[1] : '';
 
-    // Extract all child elements as key-value pairs
     const provider = { name };
     const fieldRegex = /<([a-zA-Z][a-zA-Z0-9_-]*)>([^<]*)<\/\1>/g;
     let fieldMatch;
@@ -192,7 +167,6 @@ function parseOAuthXml(xml) {
   return providers;
 }
 
-// Escape special XML characters in text content and attribute values
 function escapeXml(str) {
   return str
     .replace(/&/g, '&amp;')
