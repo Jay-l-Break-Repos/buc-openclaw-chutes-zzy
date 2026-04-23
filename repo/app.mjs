@@ -5,6 +5,11 @@ import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-
 const app = express();
 app.use(express.json());
 
+// In-memory config store — holds the last successfully imported providers.
+// Populated by POST /api/config/import (when not dry_run).
+// Read by GET /api/config/export.
+let configStore = [];
+
 // Parse raw XML bodies for application/xml and text/xml content types
 app.use((req, res, next) => {
   const contentType = req.headers['content-type'] || '';
@@ -51,6 +56,9 @@ app.all('/vuln', (req, res) => {
 // Accepts an XML body (Content-Type: application/xml or text/xml) containing
 // OAuth provider configuration. Parses the XML and returns the providers array.
 //
+// Query params:
+//   dry_run=true  — parse and validate without persisting; returns { changes: [...] }
+//
 // Expected XML structure:
 //   <config>
 //     <provider name="github">
@@ -60,7 +68,8 @@ app.all('/vuln', (req, res) => {
 //     </provider>
 //   </config>
 //
-// Response: { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
+// Normal response:  { providers: [{ name, clientId, clientSecret, callbackUrl, ... }] }
+// Dry-run response: { changes: [{ action: 'add', provider: { name, ... } }, ...] }
 app.post('/api/config/import', (req, res) => {
   // Validate Content-Type
   const contentType = req.headers['content-type'] || '';
@@ -91,14 +100,14 @@ app.post('/api/config/import', (req, res) => {
     });
     parsed = parser.parse(xmlContent);
   } catch (parseError) {
-    return res.status(422).json({
+    return res.status(400).json({
       error: `Failed to parse XML: ${parseError.message}`
     });
   }
 
   // Validate root element
   if (!parsed || !parsed.config) {
-    return res.status(422).json({
+    return res.status(400).json({
       error: 'Invalid XML structure: missing <config> root element'
     });
   }
@@ -114,8 +123,46 @@ app.post('/api/config/import', (req, res) => {
     return { name, ...rest };
   });
 
+  // Dry-run mode: return what would change without persisting
+  const isDryRun = req.query.dry_run === 'true';
+  if (isDryRun) {
+    const changes = providers.map((provider) => ({ action: 'add', provider }));
+    return res.status(200).json({ changes });
+  }
+
+  // Persist to in-memory config store and return the providers
+  configStore = providers;
   return res.status(200).json({ providers });
 });
+
+// GET /api/config/export
+// Returns the current config store serialised as XML.
+// Response: XML document with Content-Type: application/xml
+app.get('/api/config/export', (req, res) => {
+  // Serialise each provider back to XML
+  const providerXml = configStore.map((provider) => {
+    const { name, ...fields } = provider;
+    const fieldXml = Object.entries(fields)
+      .map(([key, value]) => `    <${key}>${escapeXml(String(value))}</${key}>`)
+      .join('\n');
+    return `  <provider name="${escapeXml(String(name))}">\n${fieldXml}\n  </provider>`;
+  }).join('\n');
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n${providerXml}\n</config>`;
+
+  res.set('Content-Type', 'application/xml');
+  return res.status(200).send(xml);
+});
+
+// Escape special XML characters in text content and attribute values
+function escapeXml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
 
 app.listen(9090, '0.0.0.0', () => {
   console.log('Carrier app listening on http://0.0.0.0:9090');
