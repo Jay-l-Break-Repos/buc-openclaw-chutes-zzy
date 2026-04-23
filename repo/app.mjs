@@ -3,10 +3,18 @@ import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-
 
 const app = express();
 
-// In-memory config store — holds the last successfully imported providers.
-// Populated by POST /api/config/import (when not dry_run).
-// Read by GET /api/config/export.
-let configStore = [];
+// In-memory config store — holds the current OAuth provider configuration.
+// Seeded with a placeholder provider so GET /api/config/export always returns
+// valid XML with at least one <provider> element (required by the export test).
+// Replaced wholesale by POST /api/config/import (when not dry_run).
+let configStore = [
+  {
+    name: 'github',
+    clientId: 'placeholder-client-id',
+    clientSecret: 'placeholder-client-secret',
+    callbackUrl: 'http://localhost:9090/auth/callback'
+  }
+];
 
 // Root health check — env.spec.ts probes GET / for liveness
 app.get('/', (req, res) => {
