@@ -3,31 +3,18 @@ import { XMLParser } from 'fast-xml-parser';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
+
+// Parse JSON bodies (for /vuln and other JSON endpoints)
 app.use(express.json());
+
+// Parse XML bodies as plain text — populates req.body with the raw XML string
+// for requests with Content-Type: application/xml or text/xml
+app.use(express.text({ type: ['application/xml', 'text/xml'] }));
 
 // In-memory config store — holds the last successfully imported providers.
 // Populated by POST /api/config/import (when not dry_run).
 // Read by GET /api/config/export.
 let configStore = [];
-
-// Parse raw XML bodies for application/xml and text/xml content types
-app.use((req, res, next) => {
-  const contentType = req.headers['content-type'] || '';
-  if (contentType.includes('application/xml') || contentType.includes('text/xml')) {
-    let data = '';
-    req.setEncoding('utf-8');
-    req.on('data', (chunk) => { data += chunk; });
-    req.on('end', () => {
-      req.rawXml = data;
-      next();
-    });
-    req.on('error', (err) => {
-      next(err);
-    });
-  } else {
-    next();
-  }
-});
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
@@ -79,8 +66,9 @@ app.post('/api/config/import', (req, res) => {
     });
   }
 
-  // Ensure we received a body
-  const xmlContent = req.rawXml;
+  // express.text() populates req.body with the raw string for XML content types.
+  // If the body is missing or empty, req.body will be undefined or an empty string.
+  const xmlContent = typeof req.body === 'string' ? req.body : '';
   if (!xmlContent || xmlContent.trim() === '') {
     return res.status(400).json({
       error: 'Request body is empty. Please provide an XML configuration.'
