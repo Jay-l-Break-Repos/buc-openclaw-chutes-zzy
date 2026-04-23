@@ -1,5 +1,4 @@
 import express from 'express';
-import { XMLParser } from 'fast-xml-parser';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
@@ -80,41 +79,15 @@ app.post(
       });
     }
 
-    // Parse the XML
-    let parsed;
+    // Parse the XML using the built-in parser
+    let providers;
     try {
-      const parser = new XMLParser({
-        ignoreAttributes: false,
-        attributeNamePrefix: '@_',
-        parseAttributeValue: true,
-        parseTagValue: true,
-        trimValues: true,
-        isArray: (tagName) => tagName === 'provider'  // always treat <provider> as array
-      });
-      parsed = parser.parse(xmlContent);
+      providers = parseOAuthXml(xmlContent);
     } catch (parseError) {
       return res.status(400).json({
-        error: `Failed to parse XML: ${parseError.message}`
+        error: parseError.message
       });
     }
-
-    // Validate root element
-    if (!parsed || !parsed.config) {
-      return res.status(400).json({
-        error: 'Invalid XML structure: missing <config> root element'
-      });
-    }
-
-    // Extract providers — fast-xml-parser returns an array (forced by isArray above)
-    // or undefined if no <provider> elements exist
-    const rawProviders = parsed.config.provider;
-    const providerList = Array.isArray(rawProviders) ? rawProviders : [];
-
-    // Map each provider to a clean object: lift the name attribute and keep child elements
-    const providers = providerList.map((p) => {
-      const { '@_name': name, ...rest } = p;
-      return { name, ...rest };
-    });
 
     // Dry-run mode: return what would change without persisting
     const isDryRun = req.query.dry_run === 'true';
@@ -147,6 +120,65 @@ app.get('/api/config/export', (req, res) => {
   res.set('Content-Type', 'application/xml');
   return res.status(200).send(xml);
 });
+
+// ---------------------------------------------------------------------------
+// Minimal XML parser for OAuth provider config
+// Parses the specific structure:
+//   <config>
+//     <provider name="...">
+//       <field>value</field>
+//       ...
+//     </provider>
+//   </config>
+// Returns an array of provider objects: [{ name, field, ... }, ...]
+// Throws an Error with a descriptive message on any parse failure.
+// ---------------------------------------------------------------------------
+function parseOAuthXml(xml) {
+  const str = xml.trim();
+
+  // Basic well-formedness: must start with < and end with >
+  if (!str.startsWith('<') || !str.endsWith('>')) {
+    throw new Error('Invalid XML: document must start with < and end with >');
+  }
+
+  // Must contain a <config> root element
+  if (!str.includes('<config') || !str.includes('</config>')) {
+    throw new Error('Invalid XML structure: missing <config> root element');
+  }
+
+  // Extract the content inside <config>...</config>
+  const configMatch = str.match(/<config[^>]*>([\s\S]*?)<\/config>/);
+  if (!configMatch) {
+    throw new Error('Invalid XML structure: malformed <config> element');
+  }
+  const configBody = configMatch[1];
+
+  // Find all <provider ...>...</provider> blocks
+  const providerRegex = /<provider([^>]*)>([\s\S]*?)<\/provider>/g;
+  const providers = [];
+  let match;
+
+  while ((match = providerRegex.exec(configBody)) !== null) {
+    const attrStr = match[1];
+    const body = match[2];
+
+    // Extract the name attribute
+    const nameMatch = attrStr.match(/name\s*=\s*["']([^"']*)["']/);
+    const name = nameMatch ? nameMatch[1] : '';
+
+    // Extract all child elements as key-value pairs
+    const provider = { name };
+    const fieldRegex = /<([a-zA-Z][a-zA-Z0-9_-]*)>([^<]*)<\/\1>/g;
+    let fieldMatch;
+    while ((fieldMatch = fieldRegex.exec(body)) !== null) {
+      provider[fieldMatch[1]] = fieldMatch[2].trim();
+    }
+
+    providers.push(provider);
+  }
+
+  return providers;
+}
 
 // Escape special XML characters in text content and attribute values
 function escapeXml(str) {
