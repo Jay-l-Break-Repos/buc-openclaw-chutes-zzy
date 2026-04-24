@@ -363,6 +363,12 @@ function parseMultipart(buffer, boundary) {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory config store for import/export round-trip
+// ---------------------------------------------------------------------------
+
+let lastImportedConfig = null;
+
+// ---------------------------------------------------------------------------
 // POST /api/config/import endpoint
 // ---------------------------------------------------------------------------
 
@@ -470,12 +476,33 @@ router.post('/api/config/import', (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// GET /api/config/export endpoint
+// ---------------------------------------------------------------------------
+
+router.get('/api/config/export', (req, res) => {
+  if (!lastImportedConfig) {
+    return res.status(404).json({
+      success: false,
+      error: 'Not Found',
+      message: 'No configuration has been imported yet.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: 'Configuration exported successfully',
+    ...lastImportedConfig,
+  });
+});
+
 /**
  * Process an XML string: parse, extract OAuth providers, and respond.
  */
 function processXml(xmlString, filename, res) {
   if (!xmlString || xmlString.trim().length === 0) {
     return res.status(400).json({
+      success: false,
       error: 'Bad Request',
       message: 'The uploaded file is empty. Please provide a valid XML configuration file.',
     });
@@ -486,16 +513,25 @@ function processXml(xmlString, filename, res) {
     const { rootElement, providers } = extractOAuthProviders(tree);
     const config = simplifyNode(tree);
 
-    return res.status(200).json({
+    const responseData = {
+      success: true,
       message: 'XML configuration parsed successfully',
       filename: filename || null,
+      size: Buffer.byteLength(xmlString, 'utf-8'),
       rootElement,
       providers,
       config,
-    });
+      data: config,
+    };
+
+    // Store for export
+    lastImportedConfig = responseData;
+
+    return res.status(200).json(responseData);
   } catch (err) {
-    return res.status(400).json({
-      error: 'Bad Request',
+    return res.status(422).json({
+      success: false,
+      error: 'Unprocessable Entity',
       message: `Failed to parse XML: ${err.message}`,
     });
   }
