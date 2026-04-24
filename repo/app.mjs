@@ -1,8 +1,12 @@
 import express from 'express';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
+import configImportRouter from './configImport.mjs';
 
 const app = express();
 app.use(express.json());
+
+// Mount the XML configuration import/export routes
+app.use(configImportRouter);
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
