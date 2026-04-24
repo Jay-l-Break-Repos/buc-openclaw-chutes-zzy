@@ -219,15 +219,30 @@ function buildTree(tokens) {
 /**
  * Simplify the raw XML tree into a plain JS object.
  * Leaf nodes become key: textValue pairs; branch nodes become nested objects.
+ * Attributes are merged into the object alongside child elements.
  * Repeated sibling names become arrays.
  */
 function simplifyNode(node) {
   // Leaf node — has text content and no child elements
   if (node._children.length === 0) {
+    // If the leaf has attributes, return an object with attributes + text
+    if (node._attributes && Object.keys(node._attributes).length > 0) {
+      const obj = { ...node._attributes };
+      if (node._text) {
+        obj._text = node._text;
+      }
+      return obj;
+    }
     return node._text ?? '';
   }
 
   const obj = {};
+
+  // Merge attributes into the object
+  if (node._attributes && Object.keys(node._attributes).length > 0) {
+    Object.assign(obj, node._attributes);
+  }
+
   for (const child of node._children) {
     const value = simplifyNode(child);
     if (obj[child._name] !== undefined) {
@@ -245,14 +260,66 @@ function simplifyNode(node) {
 
 /**
  * Extract OAuth provider settings from the parsed XML tree.
+ *
+ * Finds all <provider> elements (direct children of root, or nested under
+ * a <providers> wrapper) and returns them as an array of flat objects where
+ * each provider's XML attributes and child element text values are merged
+ * into a single object.
+ *
+ * Example XML:
+ *   <OAuthConfig>
+ *     <provider name="github">
+ *       <clientId>abc123</clientId>
+ *     </provider>
+ *   </OAuthConfig>
+ *
+ * Returns: { providers: [{ name: "github", clientId: "abc123" }] }
  */
 function extractOAuthProviders(tree) {
-  const simplified = simplifyNode(tree);
+  const providers = [];
 
-  // The root element name is the tree's _name — we return the content beneath it
+  // Collect <provider> nodes — they may be direct children of root,
+  // or nested inside a <providers> wrapper element.
+  const providerNodes = [];
+
+  for (const child of tree._children) {
+    if (child._name === 'provider') {
+      providerNodes.push(child);
+    } else if (child._name === 'providers') {
+      // Look inside <providers> wrapper
+      for (const grandchild of child._children) {
+        if (grandchild._name === 'provider') {
+          providerNodes.push(grandchild);
+        }
+      }
+    }
+  }
+
+  for (const providerNode of providerNodes) {
+    const providerObj = {};
+
+    // Merge attributes (e.g. name="github")
+    if (providerNode._attributes && Object.keys(providerNode._attributes).length > 0) {
+      Object.assign(providerObj, providerNode._attributes);
+    }
+
+    // Merge child elements as key-value pairs
+    for (const child of providerNode._children) {
+      if (child._children.length === 0) {
+        // Leaf child — use text value
+        providerObj[child._name] = child._text ?? '';
+      } else {
+        // Nested child — simplify recursively
+        providerObj[child._name] = simplifyNode(child);
+      }
+    }
+
+    providers.push(providerObj);
+  }
+
   return {
     rootElement: tree._name,
-    providers: simplified,
+    providers,
   };
 }
 
