@@ -2,12 +2,21 @@ import express from 'express';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
-app.use(express.json());
 
 // In-memory config store — seeded so export always has data
 let configStore = [
   { name: 'github', clientId: 'placeholder-id', clientSecret: 'placeholder-secret', callbackUrl: 'http://localhost:9090/auth/callback' }
 ];
+
+// Helper: read raw request body as a string
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('error', reject);
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+  });
+}
 
 app.get('/', (_req, res) => res.json({ status: 'ok' }));
 
@@ -26,10 +35,16 @@ app.get('/health', (req, res) => {
 //
 // The response will be {"result":{"code":"bare_auth_code_no_url","state":"legitimate-state-value"}}
 // proving the attacker-supplied code was accepted without state verification.
-app.all('/vuln', (req, res) => {
+app.get('/vuln', (req, res) => {
+  const input         = req.query?.input         ?? '';
+  const expectedState = req.query?.expectedState  ?? 'legitimate-state-value';
+  const result = parseOAuthCallbackInput(input, expectedState);
+  res.json({ result });
+});
+
+app.post('/vuln', express.json(), (req, res) => {
   const input         = req.body?.input         ?? req.query?.input         ?? '';
   const expectedState = req.body?.expectedState  ?? req.query?.expectedState  ?? 'legitimate-state-value';
-
   const result = parseOAuthCallbackInput(input, expectedState);
   res.json({ result });
 });
@@ -39,35 +54,36 @@ app.all('/vuln', (req, res) => {
 // Accepts Content-Type: application/xml or text/xml with XML in the request body.
 // ?dry_run=true returns { changes: [...] } without persisting.
 // ---------------------------------------------------------------------------
-app.post('/api/config/import', (req, res) => {
+app.post('/api/config/import', async (req, res) => {
   const ct = req.headers['content-type'] || '';
   if (!ct.includes('application/xml') && !ct.includes('text/xml')) {
     return res.status(400).json({ error: 'Content-Type must be application/xml or text/xml' });
   }
 
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('error', (err) => res.status(500).json({ error: err.message }));
-  req.on('end', () => {
-    const xml = Buffer.concat(chunks).toString('utf-8').trim();
-    if (!xml) {
-      return res.status(400).json({ error: 'Request body is empty.' });
-    }
+  let xml;
+  try {
+    xml = (await readBody(req)).trim();
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 
-    let providers;
-    try {
-      providers = parseOAuthXml(xml);
-    } catch (e) {
-      return res.status(400).json({ error: e.message });
-    }
+  if (!xml) {
+    return res.status(400).json({ error: 'Request body is empty.' });
+  }
 
-    if (req.query.dry_run === 'true') {
-      return res.status(200).json({ changes: providers.map((p) => ({ action: 'add', provider: p })) });
-    }
+  let providers;
+  try {
+    providers = parseOAuthXml(xml);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
 
-    configStore = providers;
-    return res.status(200).json({ providers });
-  });
+  if (req.query.dry_run === 'true') {
+    return res.status(200).json({ changes: providers.map((p) => ({ action: 'add', provider: p })) });
+  }
+
+  configStore = providers;
+  return res.status(200).json({ providers });
 });
 
 // ---------------------------------------------------------------------------
