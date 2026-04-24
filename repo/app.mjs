@@ -3,6 +3,10 @@ import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-
 import configImportRouter from './configImport.mjs';
 
 const app = express();
+
+// Parse raw XML bodies so they're available as req.body (Buffer)
+app.use(express.raw({ type: ['application/xml', 'text/xml'], limit: '10mb' }));
+
 app.use(express.json());
 
 // Mount the XML configuration import/export routes

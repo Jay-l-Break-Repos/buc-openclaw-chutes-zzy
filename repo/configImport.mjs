@@ -380,6 +380,20 @@ router.post('/api/config/import', (req, res) => {
     }
 
     const boundary = boundaryMatch[1].replace(/;.*$/, '').trim();
+
+    // If express has already parsed the body as a Buffer, use it directly
+    if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
+      const file = parseMultipart(req.body, boundary);
+      if (!file) {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'No file found in the upload. Please send an XML file in the "file" field.',
+        });
+      }
+      const xmlString = file.data.toString('utf-8');
+      return processXml(xmlString, file.filename, res);
+    }
+
     const chunks = [];
 
     req.on('data', (chunk) => chunks.push(chunk));
@@ -410,6 +424,18 @@ router.post('/api/config/import', (req, res) => {
 
   // ---- Handle raw XML body (application/xml or text/xml) ----
   if (contentType.includes('xml')) {
+    // If express.raw() already parsed the body, use it directly
+    if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
+      const xmlString = req.body.toString('utf-8');
+      return processXml(xmlString, null, res);
+    }
+
+    // If body is a string (e.g. from express.text())
+    if (req.body && typeof req.body === 'string' && req.body.length > 0) {
+      return processXml(req.body, null, res);
+    }
+
+    // Fallback: read from stream
     const chunks = [];
 
     req.on('data', (chunk) => chunks.push(chunk));
