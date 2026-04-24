@@ -454,6 +454,14 @@ router.post('/api/config/import', (req, res) => {
     return;
   }
 
+  // ---- Handle JSON body with embedded XML string ----
+  if (contentType.includes('json') && req.body) {
+    const xmlString = req.body.xml || req.body.xmlContent || req.body.content || req.body.data;
+    if (typeof xmlString === 'string' && xmlString.trim().length > 0) {
+      return processXml(xmlString, req.body.filename || null, res);
+    }
+  }
+
   // ---- Unsupported content type ----
   return res.status(400).json({
     error: 'Bad Request',
@@ -476,12 +484,14 @@ function processXml(xmlString, filename, res) {
   try {
     const tree = parseXml(xmlString);
     const { rootElement, providers } = extractOAuthProviders(tree);
+    const config = simplifyNode(tree);
 
     return res.status(200).json({
       message: 'XML configuration parsed successfully',
       filename: filename || null,
       rootElement,
       providers,
+      config,
     });
   } catch (err) {
     return res.status(400).json({
