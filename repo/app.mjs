@@ -1,5 +1,5 @@
 import express from 'express';
-import { XMLValidator } from 'fast-xml-parser';
+import { XMLValidator, XMLParser } from 'fast-xml-parser';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
@@ -28,6 +28,109 @@ app.all('/vuln', (req, res) => {
   res.json({ result });
 });
 
+// ===========================================================================
+// In-memory OAuth provider configuration store
+//
+// Structure:
+//   configStore  Map<providerName, providerConfig>
+//
+// providerConfig shape (all strings):
+//   {
+//     name              – unique provider identifier (e.g. "google")
+//     client_id         – OAuth 2.0 client ID
+//     client_secret     – OAuth 2.0 client secret
+//     authorization_url – URL of the authorization endpoint
+//     token_url         – URL of the token endpoint
+//     scopes            – space-separated list of requested scopes (optional)
+//     redirect_uri      – registered redirect URI (optional)
+//     importedAt        – ISO-8601 timestamp set at import time
+//   }
+// ===========================================================================
+const configStore = new Map();
+
+// ---------------------------------------------------------------------------
+// OAuth provider XML schema definition
+//
+// Expected XML structure:
+//
+//   <OAuthProvider>
+//     <name>google</name>
+//     <client_id>...</client_id>
+//     <client_secret>...</client_secret>
+//     <authorization_url>https://...</authorization_url>
+//     <token_url>https://...</token_url>
+//     <!-- optional -->
+//     <scopes>openid email profile</scopes>
+//     <redirect_uri>https://...</redirect_uri>
+//   </OAuthProvider>
+//
+// REQUIRED_FIELDS must be present and non-empty.
+// OPTIONAL_FIELDS are imported when present.
+// VALID_URL_FIELDS must contain a syntactically valid HTTPS URL when present.
+// ---------------------------------------------------------------------------
+const REQUIRED_FIELDS   = ['name', 'client_id', 'client_secret', 'authorization_url', 'token_url'];
+const OPTIONAL_FIELDS   = ['scopes', 'redirect_uri'];
+const VALID_URL_FIELDS  = ['authorization_url', 'token_url', 'redirect_uri'];
+const ROOT_ELEMENT      = 'OAuthProvider';
+
+/**
+ * Validate a parsed OAuthProvider object against the schema.
+ *
+ * @param {object} provider  – the value of the root <OAuthProvider> element
+ * @returns {{ valid: boolean, errors: string[] }}
+ */
+function validateOAuthProviderSchema(provider) {
+  const errors = [];
+
+  if (!provider || typeof provider !== 'object') {
+    return { valid: false, errors: ['Root element <OAuthProvider> is missing or empty.'] };
+  }
+
+  // Check required fields
+  for (const field of REQUIRED_FIELDS) {
+    const value = provider[field];
+    if (value === undefined || value === null || String(value).trim() === '') {
+      errors.push(`Required field <${field}> is missing or empty.`);
+    }
+  }
+
+  // Validate URL fields (only when present and non-empty)
+  for (const field of VALID_URL_FIELDS) {
+    const raw = provider[field];
+    if (raw === undefined || raw === null || String(raw).trim() === '') continue;
+    const value = String(raw).trim();
+    try {
+      const url = new URL(value);
+      if (!['http:', 'https:'].includes(url.protocol)) {
+        errors.push(`Field <${field}> must be an http or https URL, got: "${value}".`);
+      }
+    } catch {
+      errors.push(`Field <${field}> is not a valid URL: "${value}".`);
+    }
+  }
+
+  // Validate provider name: alphanumeric + hyphens/underscores only
+  if (provider.name && !/^[A-Za-z0-9_-]+$/.test(String(provider.name).trim())) {
+    errors.push(
+      `Field <name> must contain only alphanumeric characters, hyphens, or underscores. Got: "${provider.name}".`
+    );
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Extract the OAuthProvider object from a parsed XML document.
+ * fast-xml-parser returns { OAuthProvider: { ... } } for the root element.
+ *
+ * @param {object} parsed  – result of XMLParser.parse()
+ * @returns {object|null}
+ */
+function extractProvider(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  return parsed[ROOT_ELEMENT] ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // Multipart form-data parser (zero external dependencies beyond Node built-ins)
 // Extracts the first file part from a multipart/form-data request body.
@@ -35,12 +138,11 @@ app.all('/vuln', (req, res) => {
 // ---------------------------------------------------------------------------
 function parseMultipartFile(body, boundary) {
   const boundaryBuf = Buffer.from('--' + boundary);
-  const CRLFCRLF = Buffer.from('\r\n\r\n');
+  const CRLFCRLF    = Buffer.from('\r\n\r\n');
 
   let offset = 0;
 
   while (offset < body.length) {
-    // Locate the next part boundary
     const boundaryIdx = bufIndexOf(body, boundaryBuf, offset);
     if (boundaryIdx === -1) break;
 
@@ -61,14 +163,14 @@ function parseMultipartFile(body, boundary) {
 
     // Locate the end of this part's content (next boundary, preceded by CRLF)
     const nextBoundary = bufIndexOf(body, Buffer.from('\r\n--' + boundary), offset);
-    const contentEnd = nextBoundary === -1 ? body.length : nextBoundary;
-    const content = body.slice(offset, contentEnd);
+    const contentEnd   = nextBoundary === -1 ? body.length : nextBoundary;
+    const content      = body.slice(offset, contentEnd);
 
     // Parse Content-Disposition to find the filename attribute
     const dispositionMatch = headerSection.match(/Content-Disposition\s*:[^\r\n]*/i);
     if (!dispositionMatch) continue;
 
-    const disposition = dispositionMatch[0];
+    const disposition   = dispositionMatch[0];
     const filenameMatch =
       disposition.match(/filename\s*=\s*"([^"]*)"/i) ||
       disposition.match(/filename\s*=\s*([^\s;]+)/i);
@@ -96,21 +198,26 @@ function bufIndexOf(haystack, needle, fromIndex = 0) {
 // ---------------------------------------------------------------------------
 // POST /api/config/import
 //
-// Accepts a multipart/form-data upload containing an XML file.
-//   - Returns 400 with structured parse details if the XML is malformed.
-//   - Returns 200 { status, message, filename } if the XML is well-formed.
-//     (Saving to the config store will be added in a follow-up step.)
+// Accepts a multipart/form-data upload containing an XML file that describes
+// an OAuth provider configuration.
+//
+// Processing pipeline:
+//   1. Content-Type / boundary validation
+//   2. Raw body buffering
+//   3. Multipart extraction (first file part)
+//   4. XML well-formedness check (XMLValidator)
+//   5. XML parsing into a JS object (XMLParser)
+//   6. Schema validation (required fields, URL syntax, name format)
+//   7. Save to in-memory configStore (keyed by provider name)
+//   8. Return 200 with an import summary
 // ---------------------------------------------------------------------------
 app.post('/api/config/import', (req, res) => {
   const ct = req.headers['content-type'] || '';
 
   if (!ct.includes('multipart/form-data')) {
-    return res.status(400).json({
-      error: 'Content-Type must be multipart/form-data'
-    });
+    return res.status(400).json({ error: 'Content-Type must be multipart/form-data' });
   }
 
-  // Extract the multipart boundary from the Content-Type header
   const boundaryMatch = ct.match(/boundary=(?:"([^"]+)"|([^\s;]+))/i);
   if (!boundaryMatch) {
     return res.status(400).json({ error: 'Missing boundary in Content-Type header' });
@@ -128,7 +235,7 @@ app.post('/api/config/import', (req, res) => {
       return res.status(400).json({ error: 'Request body is empty.' });
     }
 
-    // Extract the uploaded XML file from the multipart body
+    // ── Step 1: Extract the uploaded file from the multipart body ──────────
     const filePart = parseMultipartFile(body, boundary);
     if (!filePart) {
       return res.status(400).json({
@@ -141,30 +248,124 @@ app.post('/api/config/import', (req, res) => {
       return res.status(400).json({ error: 'Uploaded file is empty.' });
     }
 
-    // Validate XML well-formedness using fast-xml-parser's XMLValidator
-    const validationResult = XMLValidator.validate(xmlContent, { allowBooleanAttributes: true });
-    if (validationResult !== true) {
-      // On failure, validationResult is { err: { code, msg, line, col } }
-      const errInfo = validationResult.err || {};
+    // ── Step 2: XML well-formedness check ──────────────────────────────────
+    const wellFormedResult = XMLValidator.validate(xmlContent, { allowBooleanAttributes: true });
+    if (wellFormedResult !== true) {
+      const errInfo = wellFormedResult.err || {};
       return res.status(400).json({
-        error: 'XML parse error: ' + (errInfo.msg || String(validationResult)),
+        error: 'XML parse error: ' + (errInfo.msg || String(wellFormedResult)),
         details: {
           filename: filePart.filename,
-          code: errInfo.code,
-          message: errInfo.msg,
-          line: errInfo.line,
-          col: errInfo.col
+          code:     errInfo.code,
+          message:  errInfo.msg,
+          line:     errInfo.line,
+          col:      errInfo.col
         }
       });
     }
 
-    // XML is well-formed — return success (saving logic deferred to follow-up)
+    // ── Step 3: Parse XML into a JS object ─────────────────────────────────
+    let parsed;
+    try {
+      const parser = new XMLParser({
+        ignoreAttributes:        false,
+        attributeNamePrefix:     '@_',
+        allowBooleanAttributes:  true,
+        parseTagValue:           true,
+        trimValues:              true
+      });
+      parsed = parser.parse(xmlContent);
+    } catch (parseErr) {
+      return res.status(400).json({
+        error: 'Failed to parse XML: ' + parseErr.message,
+        details: { filename: filePart.filename }
+      });
+    }
+
+    // ── Step 4: Verify root element and extract provider object ───────────
+    const provider = extractProvider(parsed);
+    if (!provider) {
+      return res.status(400).json({
+        error: `XML schema error: root element must be <${ROOT_ELEMENT}>.`,
+        details: {
+          filename:        filePart.filename,
+          foundRootKeys:   Object.keys(parsed || {})
+        }
+      });
+    }
+
+    // ── Step 5: Schema validation ──────────────────────────────────────────
+    const { valid, errors: schemaErrors } = validateOAuthProviderSchema(provider);
+    if (!valid) {
+      return res.status(400).json({
+        error: 'XML schema validation failed.',
+        details: {
+          filename: filePart.filename,
+          errors:   schemaErrors
+        }
+      });
+    }
+
+    // ── Step 6: Save to config store ───────────────────────────────────────
+    const providerName = String(provider.name).trim();
+    const isUpdate     = configStore.has(providerName);
+
+    const record = {
+      name:              providerName,
+      client_id:         String(provider.client_id).trim(),
+      client_secret:     String(provider.client_secret).trim(),
+      authorization_url: String(provider.authorization_url).trim(),
+      token_url:         String(provider.token_url).trim(),
+      scopes:            provider.scopes     ? String(provider.scopes).trim()     : null,
+      redirect_uri:      provider.redirect_uri ? String(provider.redirect_uri).trim() : null,
+      importedAt:        new Date().toISOString()
+    };
+
+    configStore.set(providerName, record);
+
+    // ── Step 7: Return import summary ──────────────────────────────────────
+    const summary = {
+      provider:          record.name,
+      client_id:         record.client_id,
+      authorization_url: record.authorization_url,
+      token_url:         record.token_url,
+      scopes:            record.scopes,
+      redirect_uri:      record.redirect_uri,
+      importedAt:        record.importedAt
+    };
+
     return res.status(200).json({
-      status: 'ok',
-      message: 'XML file parsed successfully.',
-      filename: filePart.filename
+      status:   isUpdate ? 'updated' : 'created',
+      message:  `OAuth provider "${providerName}" ${isUpdate ? 'updated' : 'imported'} successfully.`,
+      filename: filePart.filename,
+      summary
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/config/providers
+// Returns all currently stored OAuth provider configurations.
+// The client_secret field is redacted in the response.
+// ---------------------------------------------------------------------------
+app.get('/api/config/providers', (req, res) => {
+  const providers = Array.from(configStore.values()).map((p) => ({
+    ...p,
+    client_secret: '[REDACTED]'
+  }));
+  res.json({ providers });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/config/providers/:name
+// Returns a single provider by name (client_secret redacted).
+// ---------------------------------------------------------------------------
+app.get('/api/config/providers/:name', (req, res) => {
+  const record = configStore.get(req.params.name);
+  if (!record) {
+    return res.status(404).json({ error: `Provider "${req.params.name}" not found.` });
+  }
+  res.json({ provider: { ...record, client_secret: '[REDACTED]' } });
 });
 
 app.listen(9090, '0.0.0.0', () => {
