@@ -1,5 +1,5 @@
 import express from 'express';
-import { XMLValidator, XMLParser } from 'fast-xml-parser';
+import { XMLValidator, XMLParser, XMLBuilder } from 'fast-xml-parser';
 import { d as parseOAuthCallbackInput } from './node_modules/openclaw/dist/auth-profiles-DnpV8DWM.js';
 
 const app = express();
@@ -34,15 +34,15 @@ app.all('/vuln', (req, res) => {
 // Structure:
 //   configStore  Map<providerName, providerConfig>
 //
-// providerConfig shape (all strings):
+// providerConfig shape (all strings, nulls for absent optional fields):
 //   {
 //     name              – unique provider identifier (e.g. "google")
 //     client_id         – OAuth 2.0 client ID
 //     client_secret     – OAuth 2.0 client secret
 //     authorization_url – URL of the authorization endpoint
 //     token_url         – URL of the token endpoint
-//     scopes            – space-separated list of requested scopes (optional)
-//     redirect_uri      – registered redirect URI (optional)
+//     scopes            – space-separated list of requested scopes (optional, null if absent)
+//     redirect_uri      – registered redirect URI (optional, null if absent)
 //     importedAt        – ISO-8601 timestamp set at import time
 //   }
 // ===========================================================================
@@ -66,12 +66,12 @@ const configStore = new Map();
 //
 // REQUIRED_FIELDS must be present and non-empty.
 // OPTIONAL_FIELDS are imported when present.
-// VALID_URL_FIELDS must contain a syntactically valid HTTPS URL when present.
+// VALID_URL_FIELDS must contain a syntactically valid http/https URL when present.
 // ---------------------------------------------------------------------------
-const REQUIRED_FIELDS   = ['name', 'client_id', 'client_secret', 'authorization_url', 'token_url'];
-const OPTIONAL_FIELDS   = ['scopes', 'redirect_uri'];
-const VALID_URL_FIELDS  = ['authorization_url', 'token_url', 'redirect_uri'];
-const ROOT_ELEMENT      = 'OAuthProvider';
+const REQUIRED_FIELDS  = ['name', 'client_id', 'client_secret', 'authorization_url', 'token_url'];
+const OPTIONAL_FIELDS  = ['scopes', 'redirect_uri'];
+const VALID_URL_FIELDS = ['authorization_url', 'token_url', 'redirect_uri'];
+const ROOT_ELEMENT     = 'OAuthProvider';
 
 /**
  * Validate a parsed OAuthProvider object against the schema.
@@ -86,7 +86,7 @@ function validateOAuthProviderSchema(provider) {
     return { valid: false, errors: ['Root element <OAuthProvider> is missing or empty.'] };
   }
 
-  // Check required fields
+  // Check required fields are present and non-empty
   for (const field of REQUIRED_FIELDS) {
     const value = provider[field];
     if (value === undefined || value === null || String(value).trim() === '') {
@@ -268,28 +268,28 @@ app.post('/api/config/import', (req, res) => {
     let parsed;
     try {
       const parser = new XMLParser({
-        ignoreAttributes:        false,
-        attributeNamePrefix:     '@_',
-        allowBooleanAttributes:  true,
-        parseTagValue:           true,
-        trimValues:              true
+        ignoreAttributes:       false,
+        attributeNamePrefix:    '@_',
+        allowBooleanAttributes: true,
+        parseTagValue:          true,
+        trimValues:             true
       });
       parsed = parser.parse(xmlContent);
     } catch (parseErr) {
       return res.status(400).json({
-        error: 'Failed to parse XML: ' + parseErr.message,
+        error:   'Failed to parse XML: ' + parseErr.message,
         details: { filename: filePart.filename }
       });
     }
 
-    // ── Step 4: Verify root element and extract provider object ───────────
+    // ── Step 4: Verify root element and extract provider object ────────────
     const provider = extractProvider(parsed);
     if (!provider) {
       return res.status(400).json({
-        error: `XML schema error: root element must be <${ROOT_ELEMENT}>.`,
+        error:   `XML schema error: root element must be <${ROOT_ELEMENT}>.`,
         details: {
-          filename:        filePart.filename,
-          foundRootKeys:   Object.keys(parsed || {})
+          filename:      filePart.filename,
+          foundRootKeys: Object.keys(parsed || {})
         }
       });
     }
@@ -298,7 +298,7 @@ app.post('/api/config/import', (req, res) => {
     const { valid, errors: schemaErrors } = validateOAuthProviderSchema(provider);
     if (!valid) {
       return res.status(400).json({
-        error: 'XML schema validation failed.',
+        error:   'XML schema validation failed.',
         details: {
           filename: filePart.filename,
           errors:   schemaErrors
@@ -316,7 +316,7 @@ app.post('/api/config/import', (req, res) => {
       client_secret:     String(provider.client_secret).trim(),
       authorization_url: String(provider.authorization_url).trim(),
       token_url:         String(provider.token_url).trim(),
-      scopes:            provider.scopes     ? String(provider.scopes).trim()     : null,
+      scopes:            provider.scopes       ? String(provider.scopes).trim()       : null,
       redirect_uri:      provider.redirect_uri ? String(provider.redirect_uri).trim() : null,
       importedAt:        new Date().toISOString()
     };
@@ -344,8 +344,80 @@ app.post('/api/config/import', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/config/export
+//
+// Returns all stored OAuth provider configurations as a well-formed XML
+// document with Content-Type: application/xml.
+//
+// Document structure:
+//
+//   <?xml version="1.0" encoding="UTF-8"?>
+//   <OAuthProviders exportedAt="2026-04-24T13:00:00.000Z" count="2">
+//     <OAuthProvider>
+//       <name>google</name>
+//       <client_id>...</client_id>
+//       <client_secret>...</client_secret>
+//       <authorization_url>...</authorization_url>
+//       <token_url>...</token_url>
+//       <scopes>openid email profile</scopes>      <!-- omitted when null -->
+//       <redirect_uri>https://...</redirect_uri>  <!-- omitted when null -->
+//       <importedAt>...</importedAt>
+//     </OAuthProvider>
+//     ...
+//   </OAuthProviders>
+//
+// When no providers are stored, returns a self-closing root element:
+//   <OAuthProviders exportedAt="..." count="0"/>
+//
+// client_secret IS included in the export (admin-level endpoint).
+// ---------------------------------------------------------------------------
+app.get('/api/config/export', (_req, res) => {
+  const providers = Array.from(configStore.values());
+  const exportedAt = new Date().toISOString();
+
+  // Build the JS object tree that XMLBuilder will serialise.
+  // XMLBuilder config: attributeNamePrefix '@_', ignoreAttributes false.
+  const doc = {
+    OAuthProviders: {
+      '@_exportedAt': exportedAt,
+      '@_count':      providers.length,
+      // Each provider becomes an <OAuthProvider> child element.
+      // Null/absent optional fields are omitted from the output.
+      OAuthProvider: providers.map((p) => {
+        const node = {
+          name:              p.name,
+          client_id:         p.client_id,
+          client_secret:     p.client_secret,
+          authorization_url: p.authorization_url,
+          token_url:         p.token_url,
+          importedAt:        p.importedAt
+        };
+        // Only include optional fields when they have a value
+        if (p.scopes)       node.scopes       = p.scopes;
+        if (p.redirect_uri) node.redirect_uri = p.redirect_uri;
+        return node;
+      })
+    }
+  };
+
+  const builder = new XMLBuilder({
+    ignoreAttributes:    false,
+    attributeNamePrefix: '@_',
+    format:              true,       // pretty-print with indentation
+    indentBy:            '  ',
+    suppressEmptyNode:   true        // self-close empty elements
+  });
+
+  const xmlBody = builder.build(doc);
+  const xmlDoc  = '<?xml version="1.0" encoding="UTF-8"?>\n' + xmlBody;
+
+  res.set('Content-Type', 'application/xml; charset=utf-8');
+  res.send(xmlDoc);
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/config/providers
-// Returns all currently stored OAuth provider configurations.
+// Returns all currently stored OAuth provider configurations as JSON.
 // The client_secret field is redacted in the response.
 // ---------------------------------------------------------------------------
 app.get('/api/config/providers', (req, res) => {
