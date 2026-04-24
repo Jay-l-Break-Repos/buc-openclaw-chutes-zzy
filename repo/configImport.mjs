@@ -8,9 +8,9 @@
  * Uses only built-in Node.js modules — no external XML parser dependency required.
  */
 
-import { Router } from 'express';
+import express from 'express';
 
-const router = Router();
+const router = express.Router();
 
 // ---------------------------------------------------------------------------
 // Lightweight XML-to-JS parser (handles the OAuth config subset we need)
